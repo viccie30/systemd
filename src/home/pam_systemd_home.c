@@ -684,21 +684,21 @@ _public_ PAM_EXTERN int pam_sm_authenticate(
                 int flags,
                 int argc, const char **argv) {
 
-        bool debug = false, suspend_please = false;
+        bool debug = false, please_suspend = false;
 
-        if (parse_env(handle, &suspend_please) < 0)
+        if (parse_env(handle, &please_suspend) < 0)
                 return PAM_AUTH_ERR;
 
         if (parse_argv(handle,
                        argc, argv,
-                       &suspend_please,
+                       &please_suspend,
                        &debug) < 0)
                 return PAM_AUTH_ERR;
 
         if (debug)
                 pam_syslog(handle, LOG_DEBUG, "pam-systemd-homed authenticating");
 
-        return acquire_home(handle, /* please_authenticate= */ true, suspend_please, debug);
+        return acquire_home(handle, /* please_authenticate= */ true, please_suspend, debug);
 }
 
 _public_ PAM_EXTERN int pam_sm_setcred(pam_handle_t *pamh, int flags, int argc, const char **argv) {
@@ -710,22 +710,22 @@ _public_ PAM_EXTERN int pam_sm_open_session(
                 int flags,
                 int argc, const char **argv) {
 
-        bool debug = false, suspend_please = false;
+        bool debug = false, please_suspend = false;
         int r;
 
-        if (parse_env(handle, &suspend_please) < 0)
+        if (parse_env(handle, &please_suspend) < 0)
                 return PAM_SESSION_ERR;
 
         if (parse_argv(handle,
                        argc, argv,
-                       &suspend_please,
+                       &please_suspend,
                        &debug) < 0)
                 return PAM_SESSION_ERR;
 
         if (debug)
                 pam_syslog(handle, LOG_DEBUG, "pam-systemd-homed session start");
 
-        r = acquire_home(handle, /* please_authenticate = */ false, suspend_please, debug);
+        r = acquire_home(handle, /* please_authenticate = */ false, please_suspend, debug);
         if (r == PAM_USER_UNKNOWN) /* Not managed by us? Don't complain. */
                 return PAM_SUCCESS;
         if (r != PAM_SUCCESS)
@@ -736,7 +736,7 @@ _public_ PAM_EXTERN int pam_sm_open_session(
                 return pam_syslog_pam_error(handle, LOG_ERR, r,
                                             "Failed to set PAM environment variable $SYSTEMD_HOME: @PAMERR@");
 
-        r = pam_putenv(handle, suspend_please ? "SYSTEMD_HOME_SUSPEND=1" : "SYSTEMD_HOME_SUSPEND=0");
+        r = pam_putenv(handle, please_suspend ? "SYSTEMD_HOME_SUSPEND=1" : "SYSTEMD_HOME_SUSPEND=0");
         if (r != PAM_SUCCESS)
                 return pam_syslog_pam_error(handle, LOG_ERR, r,
                                             "Failed to set PAM environment variable $SYSTEMD_HOME_SUSPEND: @PAMERR@");
