@@ -19,14 +19,23 @@
 #include "user-record.h"
 #include "user-util.h"
 
+typedef enum PamSystemdHomeOptions {
+        PAM_SYSTEMD_HOME_SUSPEND        = 1 << 0,
+        PAM_SYSTEMD_HOME_DEBUG          = 1 << 1,
+        PAM_SYSTEMD_HOME_NULLOK         = 1 << 2,
+        PAM_SYSTEMD_HOME_NULLRESETOK    = 1 << 3,
+        PAM_SYSTEMD_HOME_USE_AUTHTOK    = 1 << 4,
+        PAM_SYSTEMD_HOME_USE_FIRST_PASS = 1 << 5,
+} PamSystemdHomeOptions;
+
 static int parse_argv(
                 pam_handle_t *handle,
                 int argc, const char **argv,
-                bool *please_suspend,
-                bool *debug) {
+                PamSystemdHomeOptions *options) {
 
         assert(argc >= 0);
         assert(argc == 0 || argv);
+        assert(options);
 
         for (int i = 0; i < argc; i++) {
                 const char *v;
@@ -37,20 +46,32 @@ static int parse_argv(
                         k = parse_boolean(v);
                         if (k < 0)
                                 pam_syslog(handle, LOG_WARNING, "Failed to parse suspend= argument, ignoring: %s", v);
-                        else if (please_suspend)
-                                *please_suspend = k;
+                        SET_FLAG(*options, PAM_SYSTEMD_HOME_SUSPEND, k);
 
                 } else if (streq(argv[i], "debug")) {
-                        if (debug)
-                                *debug = true;
+                        SET_FLAG(*options, PAM_SYSTEMD_HOME_DEBUG, true);
 
                 } else if ((v = startswith(argv[i], "debug="))) {
                         int k;
                         k = parse_boolean(v);
                         if (k < 0)
                                 pam_syslog(handle, LOG_WARNING, "Failed to parse debug= argument, ignoring: %s", v);
-                        else if (debug)
-                                *debug = k;
+                        SET_FLAG(*options, PAM_SYSTEMD_HOME_DEBUG, k);
+
+                } else if (streq(argv[i], "nullok")) {
+                        SET_FLAG(*options, PAM_SYSTEMD_HOME_NULLOK, true);
+
+                } else if (streq(argv[i], "nullresetok")) {
+                        SET_FLAG(*options, PAM_SYSTEMD_HOME_NULLRESETOK, true);
+
+                } else if (streq(argv[i], "try_first_pass")) {
+                        /* Ignore for compatibility with pam_unix. This is the default behavior, anyway. */
+
+                } else if (streq(argv[i], "use_authtok")) {
+                        SET_FLAG(*options, PAM_SYSTEMD_HOME_USE_AUTHTOK, true);
+
+                } else if (streq(argv[i], "use_first_pass")) {
+                        SET_FLAG(*options, PAM_SYSTEMD_HOME_USE_FIRST_PASS, true);
 
                 } else
                         pam_syslog(handle, LOG_WARNING, "Unknown parameter '%s', ignoring", argv[i]);
@@ -61,10 +82,12 @@ static int parse_argv(
 
 static int parse_env(
                 pam_handle_t *handle,
-                bool *please_suspend) {
+                PamSystemdHomeOptions *options) {
 
         const char *v;
         int r;
+
+        assert(options);
 
         /* Let's read the suspend setting from an env var in addition to the PAM command line. That makes it
          * easy to declare the features of a display manager in code rather than configuration, and this is
@@ -82,8 +105,8 @@ static int parse_env(
         r = parse_boolean(v);
         if (r < 0)
                 pam_syslog(handle, LOG_WARNING, "Failed to parse $SYSTEMD_HOME_SUSPEND argument, ignoring: %s", v);
-        else if (please_suspend)
-                *please_suspend = r;
+        else
+                SET_FLAG(*options, PAM_SYSTEMD_HOME_SUSPEND, r);
 
         return 0;
 }
@@ -261,6 +284,7 @@ static void cleanup_home_fd(pam_handle_t *handle, void *data, int error_status) 
 
 static int handle_generic_user_record_error(
                 pam_handle_t *handle,
+                PamSystemdHomeOptions options,
                 const char *user_name,
                 UserRecord *secret,
                 int ret,
@@ -289,7 +313,12 @@ static int handle_generic_user_record_error(
 
                 assert(secret);
 
-                /* This didn't work? Ask for an (additional?) password */
+                /* This didn't work? Ask for an (additional?) password, if allowed. */
+
+                if (FLAGS_SET(PAM_SYSTEMD_HOME_USE_FIRST_PASS, options)) {
+                        (void) pam_prompt(handle, PAM_ERROR_MSG, NULL, "Password incorrect or not sufficient for authentication of user %s.", user_name);
+                        return pam_syslog_pam_error(handle, LOG_ERR, PAM_AUTH_ERR, "No valid password provided by previous modules.");
+                }
 
                 if (strv_isempty(secret->password))
                         r = pam_prompt(handle, PAM_PROMPT_ECHO_OFF, &newp, "Password: ");
@@ -300,9 +329,9 @@ static int handle_generic_user_record_error(
                 if (r != PAM_SUCCESS)
                         return PAM_CONV_ERR; /* no logging here */
 
-                /* An empty password is valid, but we also use an empty password to abort the request.
+                /* An empty password is valid if the nullok option was passed, but we also use an empty password to abort the request.
                    Accept an empty password once, abort the next time. */
-                if (!newp || (newp[0] == '\0' && strv_contains(secret->password, "")))
+                if (!newp || (newp[0] == '\0' && (!FLAGS_SET(PAM_SYSTEMD_HOME_NULLOK, options) || strv_contains(secret->password, ""))))
                         return pam_syslog_pam_error(handle, LOG_DEBUG, PAM_AUTHTOK_ERR,
                                                     "Password request aborted.");
 
@@ -326,6 +355,7 @@ static int handle_generic_user_record_error(
                 if (r != PAM_SUCCESS)
                         return PAM_CONV_ERR; /* no logging here */
 
+                /* Unlike passwords, recovery keys can never be empty. */
                 if (isempty(newp))
                         return pam_syslog_pam_error(handle, LOG_DEBUG, PAM_AUTHTOK_ERR,
                                                     "Recovery key request aborted.");
@@ -339,6 +369,11 @@ static int handle_generic_user_record_error(
 
                 assert(secret);
 
+                if (FLAGS_SET(PAM_SYSTEMD_HOME_USE_FIRST_PASS, options)) {
+                        (void) pam_prompt(handle, PAM_ERROR_MSG, NULL, "Password incorrect or not sufficient, and configured security token of user %s not inserted.", user_name);
+                        return pam_syslog_pam_error(handle, LOG_ERR, PAM_AUTH_ERR, "No valid password provided by previous modules.");
+                }
+
                 if (strv_isempty(secret->password)) {
                         (void) pam_prompt(handle, PAM_ERROR_MSG, NULL, "Security token of user %s not inserted.", user_name);
                         r = pam_prompt(handle, PAM_PROMPT_ECHO_OFF, &newp, "Try again with password: ");
@@ -349,7 +384,7 @@ static int handle_generic_user_record_error(
                 if (r != PAM_SUCCESS)
                         return PAM_CONV_ERR; /* no logging here */
 
-                if (!newp || (newp[0] == '\0' && strv_contains(secret->password, "")))
+                if (!newp || (newp[0] == '\0' && (!FLAGS_SET(PAM_SYSTEMD_HOME_NULLOK, options) || strv_contains(secret->password, ""))))
                         return pam_syslog_pam_error(handle, LOG_DEBUG, PAM_AUTHTOK_ERR,
                                                     "Password request aborted.");
 
@@ -472,9 +507,8 @@ static int handle_generic_user_record_error(
 
 static int acquire_home(
                 pam_handle_t *handle,
-                bool please_authenticate,
-                bool please_suspend,
-                bool debug) {
+                PamSystemdHomeOptions options,
+                bool please_authenticate) {
 
         _cleanup_(user_record_unrefp) UserRecord *ur = NULL, *secret = NULL;
         bool do_auth = please_authenticate, home_not_active = false, home_locked = false;
@@ -571,7 +605,7 @@ static int acquire_home(
                                 return pam_bus_log_create_error(handle, r);
                 }
 
-                r = sd_bus_message_append(m, "b", please_suspend);
+                r = sd_bus_message_append(m, "b", FLAGS_SET(PAM_SYSTEMD_HOME_SUSPEND, options));
                 if (r < 0)
                         return pam_bus_log_create_error(handle, r);
 
@@ -586,7 +620,7 @@ static int acquire_home(
                         else if (sd_bus_error_has_name(&error, BUS_ERROR_HOME_LOCKED))
                                 home_locked = true; /* Similar */
                         else {
-                                r = handle_generic_user_record_error(handle, ur->user_name, secret, r, &error);
+                                r = handle_generic_user_record_error(handle, options, ur->user_name, secret, r, &error);
                                 if (r == PAM_CONV_ERR) {
                                         /* Password/PIN prompts will fail in certain environments, for example when
                                          * we are called from OpenSSH's account or session hooks, or in systemd's
@@ -686,21 +720,23 @@ _public_ PAM_EXTERN int pam_sm_authenticate(
                 int flags,
                 int argc, const char **argv) {
 
-        bool debug = false, please_suspend = false;
+        PamSystemdHomeOptions options = 0;
 
-        if (parse_env(handle, &please_suspend) < 0)
+        if (parse_env(handle, &options) < 0)
                 return PAM_AUTH_ERR;
 
         if (parse_argv(handle,
                        argc, argv,
-                       &please_suspend,
-                       &debug) < 0)
+                       &options) < 0)
                 return PAM_AUTH_ERR;
 
-        if (debug)
+        if (FLAGS_SET(PAM_DISALLOW_NULL_AUTHTOK, flags))
+                SET_FLAG(options, PAM_SYSTEMD_HOME_NULLOK, false);
+
+        if (FLAGS_SET(options, PAM_SYSTEMD_HOME_DEBUG))
                 pam_syslog(handle, LOG_DEBUG, "pam-systemd-homed authenticating");
 
-        return acquire_home(handle, /* please_authenticate= */ true, please_suspend, debug);
+        return acquire_home(handle, options, /* please_authenticate= */ true);
 }
 
 _public_ PAM_EXTERN int pam_sm_setcred(pam_handle_t *pamh, int flags, int argc, const char **argv) {
@@ -712,22 +748,21 @@ _public_ PAM_EXTERN int pam_sm_open_session(
                 int flags,
                 int argc, const char **argv) {
 
-        bool debug = false, please_suspend = false;
+        PamSystemdHomeOptions options = 0;
         int r;
 
-        if (parse_env(handle, &please_suspend) < 0)
+        if (parse_env(handle, &options) < 0)
                 return PAM_SESSION_ERR;
 
         if (parse_argv(handle,
                        argc, argv,
-                       &please_suspend,
-                       &debug) < 0)
+                       &options) < 0)
                 return PAM_SESSION_ERR;
 
-        if (debug)
+        if (FLAGS_SET(options, PAM_SYSTEMD_HOME_DEBUG))
                 pam_syslog(handle, LOG_DEBUG, "pam-systemd-homed session start");
 
-        r = acquire_home(handle, /* please_authenticate = */ false, please_suspend, debug);
+        r = acquire_home(handle, options, /* please_authenticate = */ false);
         if (r == PAM_USER_UNKNOWN) /* Not managed by us? Don't complain. */
                 return PAM_SUCCESS;
         if (r != PAM_SUCCESS)
@@ -738,7 +773,7 @@ _public_ PAM_EXTERN int pam_sm_open_session(
                 return pam_syslog_pam_error(handle, LOG_ERR, r,
                                             "Failed to set PAM environment variable $SYSTEMD_HOME: @PAMERR@");
 
-        r = pam_putenv(handle, please_suspend ? "SYSTEMD_HOME_SUSPEND=1" : "SYSTEMD_HOME_SUSPEND=0");
+        r = pam_putenv(handle, FLAGS_SET(options, PAM_SYSTEMD_HOME_SUSPEND) ? "SYSTEMD_HOME_SUSPEND=1" : "SYSTEMD_HOME_SUSPEND=0");
         if (r != PAM_SUCCESS)
                 return pam_syslog_pam_error(handle, LOG_ERR, r,
                                             "Failed to set PAM environment variable $SYSTEMD_HOME_SUSPEND: @PAMERR@");
@@ -759,16 +794,15 @@ _public_ PAM_EXTERN int pam_sm_close_session(
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
         _cleanup_(sd_bus_unrefp) sd_bus *bus = NULL;
         const char *username = NULL;
-        bool debug = false;
+        PamSystemdHomeOptions options = 0;
         int r;
 
         if (parse_argv(handle,
                        argc, argv,
-                       NULL,
-                       &debug) < 0)
+                       &options) < 0)
                 return PAM_SESSION_ERR;
 
-        if (debug)
+        if (FLAGS_SET(options, PAM_SYSTEMD_HOME_DEBUG))
                 pam_syslog(handle, LOG_DEBUG, "pam-systemd-homed session end");
 
         r = pam_get_user(handle, &username, NULL);
@@ -817,23 +851,22 @@ _public_ PAM_EXTERN int pam_sm_acct_mgmt(
                 const char **argv) {
 
         _cleanup_(user_record_unrefp) UserRecord *ur = NULL;
-        bool debug = false, please_suspend = false;
+        PamSystemdHomeOptions options = 0;
         usec_t t;
         int r;
 
-        if (parse_env(handle, &please_suspend) < 0)
+        if (parse_env(handle, &options) < 0)
                 return PAM_AUTH_ERR;
 
         if (parse_argv(handle,
                        argc, argv,
-                       &please_suspend,
-                       &debug) < 0)
+                       &options) < 0)
                 return PAM_AUTH_ERR;
 
-        if (debug)
+        if (FLAGS_SET(options, PAM_SYSTEMD_HOME_DEBUG))
                 pam_syslog(handle, LOG_DEBUG, "pam-systemd-homed account management");
 
-        r = acquire_home(handle, /* please_authenticate = */ false, please_suspend, debug);
+        r = acquire_home(handle, options, /* please_authenticate = */ false);
         if (r != PAM_SUCCESS)
                 return r;
 
@@ -933,16 +966,15 @@ _public_ PAM_EXTERN int pam_sm_chauthtok(
         const char *old_password = NULL, *new_password = NULL;
         _cleanup_(sd_bus_unrefp) sd_bus *bus = NULL;
         unsigned n_attempts = 0;
-        bool debug = false;
+        PamSystemdHomeOptions options = 0;
         int r;
 
         if (parse_argv(handle,
                        argc, argv,
-                       NULL,
-                       &debug) < 0)
+                       &options) < 0)
                 return PAM_AUTH_ERR;
 
-        if (debug)
+        if (FLAGS_SET(options, PAM_SYSTEMD_HOME_DEBUG))
                 pam_syslog(handle, LOG_DEBUG, "pam-systemd-homed account management");
 
         r = pam_acquire_bus_connection(handle, &bus);
@@ -953,31 +985,40 @@ _public_ PAM_EXTERN int pam_sm_chauthtok(
         if (r != PAM_SUCCESS)
                 return r;
 
-        /* Start with cached credentials */
-        r = pam_get_item(handle, PAM_OLDAUTHTOK, (const void**) &old_password);
-        if (!IN_SET(r, PAM_BAD_ITEM, PAM_SUCCESS))
+        /* Check if we're asked to only change an expired password and return if the password is still valid. */
+        if (FLAGS_SET(flags, PAM_CHANGE_EXPIRED_AUTHTOK)) {
+                r = user_record_test_password_change_required(ur);
+                if (!IN_SET(r, EKEYREVOKED, EOWNERDEAD))
+                        return PAM_SUCCESS;
+        }
+
+        /* pam_get_authtok() and friends automatically check the cache and only ask the user if there is no
+         * cached password. */
+
+        r = pam_get_authtok(handle, PAM_OLDAUTHTOK, &old_password, NULL);
+        if (!old_password)
+                r = PAM_AUTHTOK_RECOVERY_ERR;
+        if (r != PAM_SUCCESS)
                 return pam_syslog_pam_error(handle, LOG_ERR, r, "Failed to get old password: @PAMERR@");
 
-        r = pam_get_item(handle, PAM_AUTHTOK, (const void**) &new_password);
-        if (!IN_SET(r, PAM_BAD_ITEM, PAM_SUCCESS))
-                return pam_syslog_pam_error(handle, LOG_ERR, r, "Failed to get cached password: @PAMERR@");
+        r = pam_get_authtok_noverify(handle, &new_password, NULL);
+        if (!new_password)
+                r = PAM_AUTHTOK_ERR;
+        if (r != PAM_SUCCESS)
+                return pam_syslog_pam_error(handle, LOG_ERR, r, "Failed to get new password: @PAMERR@");
 
-        if (!new_password) {
-                /* No, it's not cached, then let's ask for the password and its verification, and cache
-                 * it. */
+        if (!FLAGS_SET(PAM_SYSTEMD_HOME_NULLOK, options) && isempty(new_password))
+                return pam_syslog_pam_error(handle, LOG_DEBUG, PAM_AUTHTOK_ERR, "Password request aborted.");
 
-                r = pam_get_authtok_noverify(handle, &new_password, "New password: ");
-                if (r != PAM_SUCCESS)
-                        return pam_syslog_pam_error(handle, LOG_ERR, r, "Failed to get new password: @PAMERR@");
+        r = pam_get_authtok_verify(handle, &new_password, NULL);
+        if (!new_password)
+                r = PAM_AUTHTOK_ERR;
+        if (r != PAM_SUCCESS)
+                return pam_syslog_pam_error(handle, LOG_ERR, r, "Failed to get password again: @PAMERR@");
 
-                r = pam_get_authtok_verify(handle, &new_password, "new password: "); /* Lower case, since PAM prefixes 'Repeat' */
-                if (r != PAM_SUCCESS)
-                        return pam_syslog_pam_error(handle, LOG_ERR, r, "Failed to get password again: @PAMERR@");
-
-                // FIXME: pam_pwquality will ask for the password a third time. It really shouldn't do
-                // that, and instead assume the password was already verified once when it is found to be
-                // cached already. needs to be fixed in pam_pwquality
-        }
+        // FIXME: pam_pwquality will ask for the password a third time. It really shouldn't do
+        // that, and instead assume the password was already verified once when it is found to be
+        // cached already. needs to be fixed in pam_pwquality
 
         /* Now everything is cached and checked, let's exit from the preliminary check */
         if (FLAGS_SET(flags, PAM_PRELIM_CHECK))
@@ -987,11 +1028,9 @@ _public_ PAM_EXTERN int pam_sm_chauthtok(
         if (!old_secret)
                 return pam_log_oom(handle);
 
-        if (old_password) {
-                r = user_record_set_password(old_secret, STRV_MAKE(old_password), true);
-                if (r < 0)
-                        return pam_syslog_errno(handle, LOG_ERR, r, "Failed to store old password: %m");
-        }
+        r = user_record_set_password(old_secret, STRV_MAKE(old_password), true);
+        if (r < 0)
+                return pam_syslog_errno(handle, LOG_ERR, r, "Failed to store old password: %m");
 
         new_secret = user_record_new();
         if (!new_secret)
@@ -1023,7 +1062,7 @@ _public_ PAM_EXTERN int pam_sm_chauthtok(
 
                 r = sd_bus_call(bus, m, HOME_SLOW_BUS_CALL_TIMEOUT_USEC, &error, NULL);
                 if (r < 0) {
-                        r = handle_generic_user_record_error(handle, ur->user_name, old_secret, r, &error);
+                        r = handle_generic_user_record_error(handle, options, ur->user_name, old_secret, r, &error);
                         if (r == PAM_CONV_ERR)
                                 return pam_syslog_pam_error(handle, LOG_ERR, r,
                                                             "Failed to prompt for password/prompt.");
@@ -1037,7 +1076,7 @@ _public_ PAM_EXTERN int pam_sm_chauthtok(
                         break;
 
                 /* Try again */
-        };
+        }
 
         return pam_syslog_pam_error(handle, LOG_NOTICE, PAM_MAXTRIES,
                                     "Failed to change password for user %s: @PAMERR@", ur->user_name);
