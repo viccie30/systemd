@@ -300,7 +300,9 @@ static int handle_generic_user_record_error(
                 if (r != PAM_SUCCESS)
                         return PAM_CONV_ERR; /* no logging here */
 
-                if (isempty(newp))
+                /* An empty password is valid, but we also use an empty password to abort the request.
+                   Accept an empty password once, abort the next time. */
+                if (!newp || (newp[0] == '\0' && strv_contains(secret->password, "")))
                         return pam_syslog_pam_error(handle, LOG_DEBUG, PAM_AUTHTOK_ERR,
                                                     "Password request aborted.");
 
@@ -347,7 +349,7 @@ static int handle_generic_user_record_error(
                 if (r != PAM_SUCCESS)
                         return PAM_CONV_ERR; /* no logging here */
 
-                if (isempty(newp))
+                if (!newp || (newp[0] == '\0' && strv_contains(secret->password, "")))
                         return pam_syslog_pam_error(handle, LOG_DEBUG, PAM_AUTHTOK_ERR,
                                                     "Password request aborted.");
 
@@ -548,7 +550,7 @@ static int acquire_home(
                                 return pam_syslog_pam_error(handle, LOG_ERR, r,
                                                             "Failed to get cached password: @PAMERR@");
 
-                        if (!isempty(cached_password)) {
+                        if (cached_password) {
                                 r = user_record_set_password(secret, STRV_MAKE(cached_password), true);
                                 if (r < 0)
                                         return pam_syslog_errno(handle, LOG_ERR, r, "Failed to store password: %m");
@@ -960,16 +962,13 @@ _public_ PAM_EXTERN int pam_sm_chauthtok(
         if (!IN_SET(r, PAM_BAD_ITEM, PAM_SUCCESS))
                 return pam_syslog_pam_error(handle, LOG_ERR, r, "Failed to get cached password: @PAMERR@");
 
-        if (isempty(new_password)) {
+        if (!new_password) {
                 /* No, it's not cached, then let's ask for the password and its verification, and cache
                  * it. */
 
                 r = pam_get_authtok_noverify(handle, &new_password, "New password: ");
                 if (r != PAM_SUCCESS)
                         return pam_syslog_pam_error(handle, LOG_ERR, r, "Failed to get new password: @PAMERR@");
-
-                if (isempty(new_password))
-                        return pam_syslog_pam_error(handle, LOG_DEBUG, PAM_AUTHTOK_ERR, "Password request aborted.");
 
                 r = pam_get_authtok_verify(handle, &new_password, "new password: "); /* Lower case, since PAM prefixes 'Repeat' */
                 if (r != PAM_SUCCESS)
@@ -988,7 +987,7 @@ _public_ PAM_EXTERN int pam_sm_chauthtok(
         if (!old_secret)
                 return pam_log_oom(handle);
 
-        if (!isempty(old_password)) {
+        if (old_password) {
                 r = user_record_set_password(old_secret, STRV_MAKE(old_password), true);
                 if (r < 0)
                         return pam_syslog_errno(handle, LOG_ERR, r, "Failed to store old password: %m");
